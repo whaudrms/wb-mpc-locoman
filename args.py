@@ -3,6 +3,9 @@ DYN_ARGS = {
     "centroidal_vel": {
         "include_base": True,  # whether base velocity is part of the input
     },
+    "centroidal_vel_qp": {
+        "include_base": True,  # explicit full velocity; False eliminates base velocity
+    },
     "centroidal_acc": {
         "include_base": True,  # whether base acceleration is part of the input
     },
@@ -12,11 +15,26 @@ DYN_ARGS = {
     "whole_body_rnea": {
         "include_acc": True,  # whether to include accelerations in the input (necessary for Fatrop due to structure detection!)
     },
+    "whole_body_rnea_qp": {
+        "include_acc": True,  # accelerations and torques at every horizon node
+    },
     "whole_body_aba": {}  # the input just contains joint torques
 }
 
 # Arguments for each solver
 SOLVER_ARGS = {
+    "qp": {
+        "regularization": 1e-8,
+        "max_qp_violation": 1e-3,
+        "opts": {
+            "verbose": False,
+            "max_iter": 100000,  # OSQP iterations within ONE QP solve
+            "eps_abs": 1e-6,
+            "eps_rel": 1e-7,
+            "polish": True,
+            "warm_start": True,
+        },
+    },
     "fatrop": {
         "opts": {
             "expand": True,

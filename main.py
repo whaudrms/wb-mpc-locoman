@@ -11,7 +11,7 @@ from optimization import make_ocp
 
 # Robot params
 robot = B2_Z1(reference_pose="standing_with_arm_up", arm_joints=4)
-dynamics ="whole_body_rnea"  # see args.py for options
+dynamics = "centroidal_vel"  # see args.py for options
 
 # Tracking targets
 base_vel_des = np.array([0.1, 0, 0, 0, 0, 0])  # linear + angular velocity
@@ -20,7 +20,7 @@ arm_force_des = np.array([0, 0, 0])            # arm EE force (global)
 
 # OCP params
 nodes = 14      # OCP nodes
-tau_nodes = 3   # add torque limits for this many nodes
+tau_nodes = 3   # centroidal: torque estimates here; RNEA QP: exact limits at all nodes
 dt_min = 0.015  # initial time step
 dt_max = 0.08   # final time step
 
@@ -118,6 +118,10 @@ def mpc_loop(ocp):
 
 
 def main():
+    qp_dynamics = ("whole_body_rnea_qp", "centroidal_vel_qp")
+    if (dynamics in qp_dynamics) != (solver == "qp"):
+        raise ValueError(f'Use solver="qp" with one of {qp_dynamics}')
+
     # Initialize robot
     robot.set_gait_sequence(gait_type, gait_period)
     robot_instance = robot.robot

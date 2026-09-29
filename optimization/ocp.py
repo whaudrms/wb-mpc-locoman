@@ -118,7 +118,7 @@ class OCP:
 
         if self.arm_ee_frame:
             # Compute global velocity target for arm end-effector
-            q_0 = self.x_init[:self.nq]
+            q_0 = self.get_initial_q()
             arm_pos_0 = self.dyn.get_frame_position(self.arm_ee_frame)(q_0)
             base_pos_0 = self.dyn.get_base_position()(q_0)
             base_rot_0 = self.dyn.get_base_rotation()(q_0)
@@ -151,10 +151,7 @@ class OCP:
                 swing_phase = self.swing_schedule[idx, i]
 
                 # Contact: Friction cone
-                f_normal = f_e[2]
-                f_tangent_square = f_e[0]**2 + f_e[1]**2
-                self.opti.subject_to(in_contact * f_normal >= 0)
-                self.opti.subject_to(in_contact * mu**2 * f_normal**2 >= in_contact * f_tangent_square)
+                self.setup_friction_constraints(f_e, in_contact, mu)
 
                 # Swing: Zero force
                 self.opti.subject_to((1 - in_contact) * f_e == [0] * 3)
@@ -222,8 +219,16 @@ class OCP:
         self.U_prev = None
         self.lam_g = None
 
+    def setup_friction_constraints(self, force, in_contact, mu):
+        self.opti.subject_to(in_contact * force[2] >= 0)
+        tangent_square = force[0]**2 + force[1]**2
+        self.opti.subject_to(in_contact * (mu**2 * force[2]**2 - tangent_square) >= 0)
+
     def setup_dynamics_constraints(self, i):
         pass
+
+    def get_initial_q(self):
+        return self.x_init[:self.nq]
 
     def get_q(self, i):
         pass
