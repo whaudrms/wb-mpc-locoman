@@ -1,5 +1,9 @@
 # OSQP vs qpOASES vs HPIPM: centroidal condensed QP
 
+> Historical result: measured before centroidal QP was aligned to the original
+> NLP's delta-coordinate Euler integration, previous-node warm start and absent
+> terminal joint bounds. Regenerate data to benchmark the current formulation.
+
 동일한 고정 QP를 재생한 비교이며, solver별 해로 서로 다른 다음 QP를 생성하지 않았다.
 
 - CPU: 12th Gen Intel(R) Core(TM) i7-12700H; affinity: [0]; BLAS/OpenMP: 1 thread

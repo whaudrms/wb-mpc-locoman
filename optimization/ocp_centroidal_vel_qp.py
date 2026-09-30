@@ -3,10 +3,7 @@
 This retains full robot kinematics. It linearizes the CoM momentum dynamics
 and centroidal-map consistency; it is not the fixed-world-origin reduced model.
 """
-import casadi as ca
 import numpy as np
-import pinocchio as pin
-import pinocchio.casadi as cpin
 
 from .affine_qp import AffineQPMixin
 from .ocp_centroidal_vel import OCPCentroidalVel
@@ -44,18 +41,8 @@ class OCPCentroidalVelQP(AffineQPMixin, OCPCentroidalVel):
         self._qp_dynamics_rows = []
         self._prediction = None
         self._time = 0.0
-        q = ca.SX.sym("q", self.nq)
-        dq = ca.SX.sym("dq", self.nv)
-        q1 = ca.SX.sym("q1", self.nq)
-        self._integrate_q = ca.Function("centroidal_qp_integrate", [q, dq],
-                                       [cpin.integrate(self.dyn.model, q, dq)])
-        self._difference_q = ca.Function("centroidal_qp_difference", [q, q1],
-                                        [cpin.difference(self.dyn.model, q, q1)])
-        self._com_dynamics = self.dyn.com_dynamics()
-        self._momentum_gap = self.dyn.dynamics_gaps()
         self._base_velocity = self.dyn.base_vel_dynamics()
         self._base_acceleration = self.dyn.base_acc_dynamics()
-        self._torque_estimate = self.dyn.tau_estimate()
 
     def condense_qp(self, qp):
         self.qp_condensing_fallback_reason = None
@@ -75,72 +62,22 @@ class OCPCentroidalVelQP(AffineQPMixin, OCPCentroidalVel):
         return self.x_init[6:]
 
     def setup_dynamics_constraints(self, i):
-        h, q = self.get_h(i), self.get_q(i)
-        v, f = self.get_v(i), self.get_forces(i)
-        dt = self.dts[i]
+        # Use exactly the centroidal NLP's delta-coordinate Euler equations,
+        # momentum closure and torque estimates. Only record transition rows
+        # for algebraic condensing; no alternative integration model is added.
         row_start = self.opti.ng
-        self.opti.subject_to(self.get_h(i + 1) == h + dt * self._com_dynamics(q, f))
-        q_next = self._integrate_q(q, dt * v)
-        self.opti.subject_to(self._difference_q(q_next, self.get_q(i + 1)) == 0)
-        self._qp_dynamics_rows.append(np.arange(row_start, self.opti.ng))
-        if self.include_base:
-            self.opti.subject_to(self._momentum_gap(h, q, v) == 0)
-        if i < self.tau_nodes:
-            # Same quasi-static torque estimate as centroidal_vel, NOT full RNEA limits.
-            self.opti.subject_to(self.opti.bounded(-self.robot.joint_torque_max,
-                                                 self._torque_estimate(q, f),
-                                                 self.robot.joint_torque_max))
-
-    def setup_constraints(self, mu=0.9):
-        super().setup_constraints(mu)
-        self.opti.subject_to(self.opti.bounded(self.robot.joint_pos_min,
-                                             self.get_q(self.nodes)[7:],
-                                             self.robot.joint_pos_max))
-        # Velocities are inputs: bounds exist at 0..N-1, not at the terminal state.
+        super().setup_dynamics_constraints(i)
+        self._qp_dynamics_rows.append(np.arange(row_start, row_start + self.ndx_opt))
 
     def warm_start_variables(self):
-        x_init = np.asarray(self.opti.value(self.x_init)).ravel()
-        h0, q0 = x_init[:6], x_init[6:]
-        dts = np.array([float(self.opti.value(dt)) for dt in self.dts])
-        grid = np.r_[0., np.cumsum(dts)]
-        schedule = np.asarray(self.opti.value(self.contact_schedule))
-        previous = self._prediction if self.warm_start else None
-        f_des = np.asarray(self.opti.value(self.f_des)).ravel()
-        v0 = np.r_[np.asarray(self._base_velocity(h0, q0, np.zeros(self.nj))).ravel(),
-                    np.zeros(self.nj)]
-        for k, t in enumerate(grid):
-            if previous is None:
-                h = h0.copy()
-                q = pin.integrate(self.model, q0, t * v0)
-                u = np.r_[np.zeros(self.nv_opt), f_des]
-                old_contact = None
-            else:
-                old_t = np.clip(self._time - previous["time"] + t, 0., previous["grid"][-1])
-                j = int(np.clip(np.searchsorted(previous["grid"], old_t, side="right") - 1,
-                                0, self.nodes - 1))
-                alpha = (old_t - previous["grid"][j]) / (previous["grid"][j + 1] - previous["grid"][j])
-                xa, xb = previous["states"][j:j + 2]
-                h = (1. - alpha) * xa[:6] + alpha * xb[:6]
-                q = pin.integrate(self.model, xa[6:], alpha * pin.difference(self.model, xa[6:], xb[6:]))
-                u = previous["inputs"][j].copy()
-                old_contact = previous["contacts"][:, j]
-            if k == 0:
-                h, q = h0, q0
-            self.opti.set_initial(self.DX_opt[k], np.r_[h - h0, pin.difference(self.model, q0, q)])
-            if k == self.nodes:
-                continue
-            if self.include_base:
-                # Project the reference velocity onto A(q)v = m*h without a solve.
-                u[:6] = np.asarray(self._base_velocity(h, q, u[6:self.nv_opt])).ravel()
-            for foot in range(self.n_feet):
-                sl = slice(self.f_idx + 3 * foot, self.f_idx + 3 * foot + 3)
-                if schedule[foot, k] == 0:
-                    u[sl] = 0.
-                elif old_contact is None or old_contact[foot] == 0:
-                    u[sl] = f_des[3 * foot:3 * foot + 3]
-            if self.arm_ee_frame:
-                u[self.f_idx + 3 * self.n_feet:] = np.asarray(self.opti.value(self.arm_force_des)).ravel()
-            self.opti.set_initial(self.U_opt[k], u)
+        """Match the original NLP's previous-node-value reuse policy.
+
+        Delta states and velocities are reused at the same node index. The NLP
+        resets force guesses from desired support forces/current contacts.
+        There is no time shift, chart re-anchoring or base-velocity projection.
+        """
+        if self.warm_start:
+            super().warm_start_variables()
 
     def retract_stacked_sol(self, sol_x, retract_all=True):
         """Decode first, then reconstruct velocities/accelerations without a terminal input."""

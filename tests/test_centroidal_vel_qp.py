@@ -91,29 +91,67 @@ class CentroidalVelocityQPTests(unittest.TestCase):
         initial_q = ca.Function("initial_q_test", [o.x_init], [o.get_initial_q()])
         np.testing.assert_allclose(np.asarray(initial_q(np.r_[np.arange(6), q])).ravel(), q)
 
-    def test_one_qp_and_time_shifted_reference(self):
-        o = self.make_problem()
+    def test_one_qp_and_original_nlp_warm_start_policy(self):
+        o = self.make_problem(gait="trot")
         o.solve(retract_all=False)
-        previous = o._prediction
-        x_next = previous["states"][1]
-        o.update_params(x_next, .015)
-        np.testing.assert_allclose(o.opti.value(o.DX_opt[0], o.opti.initial()), 0., atol=1e-12)
-        t = .030
-        j = np.searchsorted(previous["grid"], t, side="right") - 1
-        alpha = (t - previous["grid"][j]) / np.diff(previous["grid"])[j]
-        xa, xb = previous["states"][j:j + 2]
-        dx = o.opti.value(o.DX_opt[1], o.opti.initial())
-        actual = np.asarray(o.dyn.state_integrate()(x_next, dx)).ravel()
-        np.testing.assert_allclose(actual[:6], (1 - alpha) * xa[:6] + alpha * xb[:6])
-        expected_q = pin.integrate(o.model, xa[6:], alpha * pin.difference(o.model, xa[6:], xb[6:]))
-        np.testing.assert_allclose(actual[6:], expected_q, atol=1e-10)
+        # The reference must reuse the original deltas, even when the measured
+        # state/time changes. Compare with the actual NLP routine, not a copy.
+        old = make_ocp("centroidal_vel", {"include_base": True},
+                       robot=o.robot, nodes=o.nodes, tau_nodes=o.tau_nodes, warm_start=True)
+        old.set_time_params(.015, .04)
+        old.set_swing_params(.07, [.1, -.2])
+        old.set_tracking_targets(np.zeros(6), np.zeros(3), np.zeros(3))
+        old.DX_prev = [x.copy() for x in o.DX_prev]
+        old.U_prev = [u.copy() for u in o.U_prev]
+        x_next = o._prediction["states"][1]
+        old.update_params(x_next, .405)
+        o.update_params(x_next, .405)
+        for new, reference in zip(o.DX_opt + o.U_opt, old.DX_opt + old.U_opt):
+            np.testing.assert_array_equal(o.opti.value(new, o.opti.initial()),
+                                          old.opti.value(reference, old.opti.initial()))
+        for state, previous in zip(o.DX_opt, o.DX_prev):
+            np.testing.assert_array_equal(o.opti.value(state, o.opti.initial()), previous)
         with patch.object(o, "_solve_qpoases", wraps=o._solve_qpoases) as solve:
             with patch.object(o, "_armijo_line_search", side_effect=AssertionError("unexpected line search")):
                 o.solve(retract_all=False)
             self.assertEqual(solve.call_count, 1)
-        self.assertEqual(o.qp_backend, "qpoases")
         self.assertEqual(o.qp_solve_count, 2)
-        self.assertLess(o.qp_constr_viol, SOLVER_ARGS["qp"]["max_qp_violation"])
+        self.assertLess(o.qp_constr_viol, 1e-3)
+
+    def test_original_euler_transition_and_no_terminal_constraints(self):
+        for include_base in (True, False):
+            o = self.make_problem(include_base)
+            rng = np.random.default_rng(62)
+            for dx in o.DX_opt:
+                o.opti.set_initial(dx, rng.normal(size=o.ndx_opt)*.03)
+            for u in o.U_opt:
+                o.opti.set_initial(u, rng.normal(size=o.nu_opt[0]))
+            qp = o.build_qp()
+            for k, rows in enumerate(o._qp_dynamics_rows):
+                dx = np.asarray(o.opti.value(o.DX_opt[k], o.opti.initial())).ravel()
+                next_dx = np.asarray(o.opti.value(o.DX_opt[k+1], o.opti.initial())).ravel()
+                v = np.asarray(o.opti.value(o.get_v(k), o.opti.initial())).ravel()
+                dt = float(o.opti.value(o.dts[k]))
+                # Equality residual is -l, since l = lbg - g(reference).
+                np.testing.assert_allclose(-qp['l'][rows[6:]], next_dx[6:]-dx[6:]-dt*v,
+                                           atol=1e-10)
+            terminal_start = o.nodes*(o.ndx_opt+o.nu_opt[0])
+            non_transition = np.ones(qp['A'].shape[0], dtype=bool)
+            non_transition[np.concatenate(o._qp_dynamics_rows)] = False
+            self.assertEqual(qp['A'][non_transition, terminal_start:].nnz, 0)
+            original = make_ocp("centroidal_vel", {"include_base": include_base},
+                                robot=o.robot, nodes=o.nodes, tau_nodes=o.tau_nodes, warm_start=True)
+            self.assertEqual(o.opti.nx, original.opti.nx)
+            # Four pyramid faces replace one cone row at each foot/node.
+            self.assertEqual(o.opti.ng-original.opti.ng, 3*o.n_feet*o.nodes)
+
+    def test_disabled_warm_start_does_not_reuse_previous_solution(self):
+        o = self.make_problem()
+        before = np.asarray(o.opti.value(o._qp_z, o.opti.initial())).ravel()
+        o.solve(retract_all=False)
+        o.warm_start = False
+        o.update_params(o._prediction['states'][1], .015)
+        np.testing.assert_array_equal(o.opti.value(o._qp_z, o.opti.initial()), before)
 
     def test_contact_switch_and_friction_pyramid(self):
         o = self.make_problem(gait="trot")
@@ -137,7 +175,7 @@ class CentroidalVelocityQPTests(unittest.TestCase):
             for gait, free_per_stage in (("stand", 13), ("trot", 11)):
                 with self.subTest(include_base=include_base, gait=gait):
                     o = self.make_problem(include_base, gait)
-                    # Nonzero reference coordinates exercise manifold transition blocks.
+                    # Nonzero reference coordinates exercise the original delta-coordinate dynamics.
                     for k in range(1, o.nodes + 1):
                         o.opti.set_initial(o.DX_opt[k], rng.normal(size=o.ndx_opt) * .003)
                     qp = o.build_qp()

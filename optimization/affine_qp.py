@@ -214,7 +214,7 @@ class AffineQPMixin:
         info = SimpleNamespace(status=result["status"], iter=result["iterations"])
         return result["x"], result["success"], info
 
-    def solve(self, retract_all=True):
+    def solve(self, retract_all=True, verbose=True):
         start = time.perf_counter()
         qp = self.build_qp()
         self.qp_assembly_time = time.perf_counter() - start
@@ -253,6 +253,11 @@ class AffineQPMixin:
         self._save_prediction()
         self.qp_total_time = time.perf_counter() - start
         self.qp_postprocess_time = self.qp_total_time - self.solve_time
+        if verbose:
+            self.print_qp_stats()
+
+    def print_qp_stats(self):
+        """Allow the MPC driver to emit diagnostics outside the timed interval."""
         print(f"QP ({self.qp_backend}, condensing={self.qp_condensing_method}): "
               f"{self.qp_status}, {self.solve_time * 1000:.2f} ms, "
               f"affine CV={self.qp_constr_viol:.3g}, nonlinear CV={self.constr_viol:.3g}")

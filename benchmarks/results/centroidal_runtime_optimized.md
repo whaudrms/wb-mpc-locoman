@@ -1,5 +1,9 @@
 # Centroidal HPIPM condensed-QP runtime optimization
 
+> Historical result: measured before centroidal QP was aligned to the original
+> NLP's delta-coordinate Euler integration, previous-node warm start and absent
+> terminal joint bounds. Regenerate data to benchmark the current formulation.
+
 14 nodes, B2 + arm 4 joints, same targets/weights/constraints/regularization/tolerances.
 BLAS/OpenMP one thread. No horizon reduction, no relaxed constraints and no approximation change.
 Times are local observations, not a comparison against an NLP solver or a deadline guarantee.

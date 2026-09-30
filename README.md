@@ -184,18 +184,29 @@ The `include_base` option in `DYN_ARGS["centroidal_vel_qp"]` selects:
 - `False`: inputs `[v_joints, forces]`; base velocity is recovered from the
   centroidal map, and that expression is differentiated with the other equations.
 
-The momentum dynamics, manifold Euler integration, foot/arm velocity tasks
-and torque estimates are linearized around a time-shifted, re-anchored
-prediction. Momentum is interpolated linearly and configuration is interpolated
-on the manifold. This retains the CoM-based model and full robot kinematics;
-it is **not** the exact affine reduced model using angular momentum about a
-fixed world origin.
+The QP reuses `centroidal_vel`'s dynamics equations directly, including
+`delta_q_next = delta_q + dt*v`, centroidal momentum dynamics, momentum closure
+and torque estimates. The nonlinear terms are linearized once per MPC update.
+Physical configuration reconstruction still uses the robot manifold.
+
+Warm starting calls the original NLP implementation: previous delta states and
+velocities are reused at the same node index; force guesses are reset from the
+desired support forces and current contact schedule. There is no trajectory
+time shift, chart re-anchoring or base-velocity projection. The first reference
+uses the original Opti initial values. `warm_start=False` disables previous-value
+reuse. The physical prediction snapshot remains available for diagnostics.
+
+This retains the CoM-based model and full robot kinematics; it is not the exact
+affine reduced model using angular momentum about a fixed world origin.
 
 As in `centroidal_vel`, the first `tau_nodes` input nodes use a **quasi-static
 Jacobian/gravity torque estimate**. There are no torque or acceleration decision
 variables, so these bounds do not guarantee full RNEA torque feasibility.
-Joint velocity bounds apply to input nodes, joint position bounds include the
-terminal state, and friction uses the same inscribed linear pyramid as RNEA QP.
+Joint position and velocity bounds apply at input nodes 0..N-1, with no added
+terminal joint constraint, matching the original centroidal NLP. Friction keeps
+the inscribed linear pyramid so the subproblem remains a convex QP. The default
+14-node model has 938 variables and 1,700 constraint rows (previously 1,716).
+The original NLP has 1,532 rows; the remaining 168 extra rows are pyramid faces.
 The arm target extracts `q` after the six momentum entries of the initial state.
 
 Output accelerations are reconstructed after the solve: joint accelerations
@@ -206,7 +217,7 @@ no terminal velocity input. They are output estimates, not optimization inputs.
 With `qp_condesed=True`, centroidal QP uses **stagewise condensing** in
 `optimization/qp_condensing.py`. At each node a small SVD eliminates local
 momentum consistency, foot/arm velocity and fixed-force equalities. The
-manifold/momentum transition Jacobian then propagates the next state as an
+delta-coordinate/momentum transition Jacobian then propagates the next state as an
 affine function of the remaining free inputs. This avoids factoring the entire
 horizon equality matrix. The full trajectory correction is `offset + basis @ y`;
 the quadratic objective and all inequalities are transformed into these free
@@ -252,24 +263,43 @@ QR fallback and solver tolerances are retained.
 ```python
 blas_threads = 1        # Set before importing NumPy/CasADi.
 qp_compile_data = True  # Native C evaluation for model/Jacobian and constraints.
-qp_profile = True       # Print assembly, condense, setup, solve and post times.
+qp_profile = True      # Print QP phase times in detailed mode.
+log_mode = "original"  # Default: original NLP logs; "detailed": full MPC + QP phases.
 ```
 
-The first native build needs a C compiler (`cc`) and took about 4 min 37 s for
-this model. It is cached under `.deps/qp_codegen`; this workspace's 14-node model
+The first native build needs a C compiler (`cc`); a previous version of the
+14-node model took about 4 min 37 s to compile. It is cached under `.deps/qp_codegen`; this workspace's 14-node model
 is already compiled. Subsequent initialization generates/hashes the code and
 loads the cached library (about 1.6 s in the check). Robot/horizon/graph changes
 may require a new build. Numerical state/target updates reuse the cache.
 `qp_compile_data=False` disables native compilation while keeping other runtime
 optimizations. This flag is separate from the legacy NLP `compile_solver` flag.
 
-The log retains the original solve time and additionally reports full MPC step
-time, including reference update and prediction reconstruction. Local results:
-initial QP processing about 20 ms, full step about 26 ms; across feasible steps
-0–96, averages were 27.2 ms and 33.7 ms. Late steps 90–96 still averaged 62 ms for
-the full step. These are observations, not an NLP comparison or deadline guarantee.
-See [measurement details](benchmarks/results/centroidal_runtime_optimized.md) and
-run `python benchmarks/profile_centroidal_runtime.py --verify` to reproduce.
+`main.py` uses one common MPC loop and timing boundary for FATROP, IPOPT and QP:
+parameter/warm-start update → input packing → optimization → nonlinear constraint
+evaluation → solution retraction → next-state calculation. Initialization,
+compilation/loading, console output and visualization are outside the interval.
+`log_mode="original"` (default) restores the original NLP output: `Solve time (ms)`,
+`CV (inf norm)`, and average/std solve-time statistics. For NLP this measures only
+`solver_function`, excluding input packing, as in the original repository. For QP
+it uses `ocp.solve_time`, including QP assembly/condensing/setup and solving;
+these legacy solve-time values do not share an identical comparison boundary.
+They are saved as `ocp.solve_times` (seconds).
+
+`log_mode="detailed"` selects the full MPC/optimization logs and QP diagnostics
+(with phase timings controlled by `qp_profile`). Both modes retain all timing
+arrays and the same common full-step measurement boundary.
+The primary comparable statistic is **Avg full MPC step (ms)** in detailed mode. Per-step values
+are exposed as `ocp.mpc_step_times`. `ocp.optimization_times` and QP phase logs
+remain diagnostic sub-timings; they are not the full MPC latency.
+
+The saved [optimization measurements](benchmarks/results/centroidal_runtime_optimized.md)
+predate the integration/warm-start/terminal-bound alignment and are historical,
+not performance claims for the current formulation. Regenerate measurements and
+frozen QP datasets after this change; do not reuse the old `/tmp` dataset.
+`python benchmarks/profile_centroidal_runtime.py --verify` measures the current
+QP path. The original nonlinear friction cone and the QP pyramid still differ;
+C compilation and solver accuracy also need matching for a full NLP comparison.
 
 When explicitly selecting OSQP, centroidal QP defaults to 50 equilibration passes (`scaling=50`) to improve
 conditioning between momentum and kinematic rows. It updates the ADMM penalty
@@ -278,8 +308,8 @@ every 25 iterations (`adaptive_rho_interval=25`) and uses `eps_prim_inf=1e-8`,
 coordinates. Solution tolerances and original-QP residual acceptance remain
 unchanged. Its OSQP workspace is rebuilt
 for the current Jacobian each update: simply updating the first workspace can
-stall even when a fresh solve of the same QP converges. The shifted physical
-trajectory is still used as the linearization reference. This is matrix scaling
+stall even when a fresh solve of the same QP converges. Previous-node warm-start
+values are used as the linearization reference. This is matrix scaling
 and one QP solve, not repeated linearization. `scaling` can be overridden in
 `SOLVER_ARGS["qp"]["opts"]`; RNEA QP retains its existing settings and workspace
 update behavior.
@@ -293,10 +323,11 @@ rotated-base arm targets, full-horizon output,
 contact switches, single solver calls, qpOASES symmetric-Hessian conversion,
 solver failure handling, backend selection, and the existing RNEA mode.
 
-Known limitation of the current example: with 14 nodes, trot, base velocity
-`[0.1, 0, 0, 0, 0, 0]` and arm velocity `[0.1, 0, -0.2]`, the predicted-state
-rollout becomes affine-QP infeasible around `t = 1.455 s` (zero-based step 97).
-The stagewise implementation completed steps 0 through 96 without QR fallback,
+Historical limitation before the integration/warm-start alignment: with 14 nodes,
+trot, base velocity `[0.1, 0, 0, 0, 0, 0]` and arm velocity `[0.1, 0, -0.2]`,
+the predicted-state rollout became affine-QP infeasible around `t = 1.455 s`
+(zero-based step 97). That result has not been re-established for the current
+formulation. The earlier stagewise implementation completed steps 0 through 96 without QR fallback,
 then stopped at step 97, with both OSQP and qpOASES. Infeasibility was also
 confirmed on the original,
 uncondensed QP by HiGHS dual-simplex and interior-point feasibility checks

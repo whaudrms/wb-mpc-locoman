@@ -60,6 +60,7 @@ SOLVER_ARGS = {
     },
     "fatrop": {
         "opts": {
+            "print_time": False,  # Keep native timing tables out of the measured solve.
             "expand": True,
             "structure_detection": "auto",
             "debug": True,
@@ -74,6 +75,8 @@ SOLVER_ARGS = {
     },
     "ipopt": {
         "opts": {
+            "print_time": False,
+            "ipopt.sb": "yes",  # Suppress the solver banner during timed calls.
             "expand": True,
             "ipopt.print_level": 0,
             "ipopt.max_iter": 100,
@@ -87,6 +90,7 @@ SOLVER_ARGS = {
     "osqp": {
         "iters": 2,  # number of SQP iterations
         "opts": {
+            "verbose": False,
             "max_iter": 20,  # number of sub-iterations for each QP
             "alpha": 1.4,
             "rho": 2e-2,

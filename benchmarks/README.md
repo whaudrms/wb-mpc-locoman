@@ -109,3 +109,10 @@ retains Python/caching optimizations but disables native data evaluation.
 Initialization/compilation and numerical verification are outside step timings.
 See [results](results/centroidal_runtime_optimized.md). The older formulation
 comparison reports describe the implementation measured at that time.
+
+The current centroidal QP reuses the original NLP's delta-coordinate Euler
+integration and warm-start routine and has no terminal joint bounds. Saved
+reports and `/tmp/centroidal_solver_cases.pkl` from before that change describe
+the older formulation. Use a new dataset path when collecting comparisons.
+`main.py` now measures the same full-step boundary for QP, FATROP and IPOPT;
+`ocp.mpc_step_times` contains those comparable measurements.

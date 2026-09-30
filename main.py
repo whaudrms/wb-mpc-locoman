@@ -19,7 +19,7 @@ from optimization import make_ocp
 
 # Robot params
 robot = B2_Z1(reference_pose="standing_with_arm_up", arm_joints=4)
-dynamics = "centroidal_vel_qp"  # see args.py for options
+dynamics = "centroidal_vel"  # see args.py for options
 
 # Tracking targets
 base_vel_des = np.array([0.1, 0, 0, 0, 0, 0])  # linear + angular velocity
@@ -39,10 +39,10 @@ swing_height = 0.07             # meters
 swing_vel_limits = [0.1, -0.2]  # meters/second
 
 # Solver
-solver = "HPIPM"  # "qpOASE" (qpOASES), "OSQP", "HPIPM"; legacy: "qp", "fatrop", "ipopt", "osqp"
+solver = "fatrop"  # "qpOASE" (qpOASES), "OSQP", "HPIPM"; legacy: "qp", "fatrop", "ipopt", "osqp"
 qp_condesed = True  # True: condensed QP; False: original QP (HPIPM uses OCP structure)
 qp_compile_data = True  # Compile model/Jacobian evaluation once and cache the shared library.
-qp_profile = True       # Print assembly/condensing/setup/solve/postprocessing times.
+qp_profile = True       # Print QP phase times when log_mode="detailed".
 warm_start = True
 compile_solver = False
 load_compiled_solver = None  # None or <filename> in "codegen/lib/"
@@ -51,6 +51,7 @@ load_compiled_solver = None  # None or <filename> in "codegen/lib/"
 mpc_loops = 200
 
 # Debug
+log_mode = "detailed"  # "original": NLP-style solve/CV logs; "detailed": full MPC + QP phases.
 plot = False  # plot joint positions, velocities, torques
 
 
@@ -72,83 +73,96 @@ def get_solver_configuration():
 
 
 def mpc_loop(ocp):
+    """Time identical full-step boundaries for QP, FATROP and IPOPT.
+
+    Timed: parameter/warm-start update, input packing, optimization, constraint
+    evaluation, solution retraction and next-state calculation. Initialization,
+    compilation/loading, console output and visualization are excluded.
+    """
+    if log_mode not in ("original", "detailed"):
+        raise ValueError('log_mode must be "original" or "detailed"')
     solve_times = []
+    optimization_times = []
     control_step_times = []
     integrate_state = ocp.dyn.state_integrate()
     constr_viol = []
-
-    # Initialize params
     x_init = ocp.x_nom
-    t_current = 0
-    ocp.update_params(x_init, t_current)
+    ocp.update_params(x_init, 0.)
 
-    # Initialize solver
     solver_kind, solver_settings = get_solver_configuration()
     ocp.init_solver(solver_kind, solver_settings)
     if compile_solver:
         ocp.compile_solver()
+    is_nlp = solver_kind in ("fatrop", "ipopt")
+    if is_nlp:
+        solver_function = (ca.external("solver_function", "codegen/lib/" + load_compiled_solver)
+                           if load_compiled_solver else ocp.solver_function)
 
-    if solver_kind in ("fatrop", "ipopt"):
-        # Get solver function
-        if load_compiled_solver:
-            solver_function = ca.external("solver_function", "codegen/lib/" + load_compiled_solver)
-        else:
-            solver_function = ocp.solver_function
-
-        for k in range(mpc_loops):
-            # Update params
-            t_current = k * dt_min
-            ocp.update_params(x_init, t_current)
+    for k in range(mpc_loops):
+        step_start = time.perf_counter()
+        ocp.update_params(x_init, k * dt_min)
+        if is_nlp:
+            optimization_start = time.perf_counter()
             solver_params = ocp.get_solver_params()
-
-            # Solve
-            start_time = time.time()
+            solve_start = time.perf_counter()
             sol_x = solver_function(*solver_params)
-            end_time = time.time()
-            sol_time = end_time - start_time
-            solve_times.append(sol_time)
-            print("Solve time (ms): ", sol_time * 1000)
-
-            # Constraint violation
+            solve_end = time.perf_counter()
+            solve_time = solve_end - solve_start
+            optimization_time = solve_end - optimization_start
             stacked_params = ocp.opti.value(ocp.opti.p)
             g, lbg, ubg = ocp.g_data(sol_x, stacked_params)
-            cv = ocp.constr_viol_norm_inf(g, lbg, ubg)
-            constr_viol.append(cv)
-            print("CV (inf norm): ", cv)
-
-            # Retract solution and update x_init
+            cv = float(ocp.constr_viol_norm_inf(g, lbg, ubg))
             ocp.retract_stacked_sol(sol_x, retract_all=False)
-            dx_sol = ocp.DX_prev[1]
-            x_init = integrate_state(x_init, dx_sol)
+        else:
+            if solver_kind == "qp":
+                ocp.solve(retract_all=False, verbose=False)
+            else:
+                # Legacy SQP emits Python diagnostics inside solve; defer them
+                # until after timing, as for the other solver paths.
+                import contextlib
+                import io
+                diagnostics = io.StringIO()
+                with contextlib.redirect_stdout(diagnostics):
+                    ocp.solve(retract_all=False)
+            solve_time = ocp.solve_time
+            optimization_time = ocp.solve_time
+            cv = float(ocp.constr_viol)
+        x_init = integrate_state(x_init, ocp.DX_prev[1])
+        step_time = time.perf_counter() - step_start
+        control_step_times.append(step_time)
+        optimization_times.append(optimization_time)
+        solve_times.append(solve_time)
+        constr_viol.append(cv)
 
-    else:
-        for k in range(mpc_loops):
-            step_start = time.perf_counter()
-            # Update params
-            t_current = k * dt_min
-            ocp.update_params(x_init, t_current)
+        # Console I/O is outside the common measurement interval in both modes.
+        if log_mode == "original":
+            print("Solve time (ms): ", solve_time * 1000)
+            print("CV (inf norm): ", cv)
+        else:
+            print(f"MPC step: {step_time * 1000:.2f} ms, "
+                  f"optimization: {optimization_time * 1000:.2f} ms, nonlinear CV={cv:.3g}")
+            if solver_kind == "qp":
+                ocp.print_qp_stats()
+            elif not is_nlp:
+                print(diagnostics.getvalue(), end="")
 
-            # Solve
-            ocp.solve(retract_all=False)
-            solve_times.append(ocp.solve_time)
-            constr_viol.append(ocp.constr_viol)
-
-            # Update x_init
-            dx_sol = ocp.DX_prev[1]
-            x_init = integrate_state(x_init, dx_sol)
-            control_step_times.append(time.perf_counter() - step_start)
-
-    # Compute total horizon time
-    T = sum([ocp.opti.value(dt) for dt in ocp.dts])
-
+    # Legacy Solve time excludes NLP input packing; QP includes QP preparation.
+    # Use mpc_step_times for comparisons with the common full-step boundary.
+    ocp.solve_times = np.asarray(solve_times)
+    ocp.mpc_step_times = np.asarray(control_step_times)
+    ocp.optimization_times = np.asarray(optimization_times)
+    ocp.mpc_constraint_violations = np.asarray(constr_viol)
+    T = sum(float(ocp.opti.value(dt)) for dt in ocp.dts)
     print("************** STATS **************")
-    print("Avg solve time (ms): ", np.average(solve_times) * 1000)
-    print("Std solve time (ms): ", np.std(solve_times) * 1000)
-    if control_step_times:
-        print("Avg full MPC step (ms): ", np.average(control_step_times) * 1000)
-    print("Avg CV (inf norm): ", np.average(constr_viol))
+    if log_mode == "original":
+        print("Avg solve time (ms): ", np.mean(ocp.solve_times) * 1000)
+        print("Std solve time (ms): ", np.std(ocp.solve_times) * 1000)
+    else:
+        print("Avg full MPC step (ms): ", np.mean(ocp.mpc_step_times) * 1000)
+        print("Std full MPC step (ms): ", np.std(ocp.mpc_step_times) * 1000)
+        print("Avg optimization time (ms): ", np.mean(ocp.optimization_times) * 1000)
+    print("Avg CV (inf norm): ", np.mean(ocp.mpc_constraint_violations))
     print("Horizon length (s): ", T)
-
     return ocp
 
 

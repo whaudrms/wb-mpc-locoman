@@ -1,5 +1,9 @@
 # HPIPM: OCP 유지 vs full condensing
 
+> Historical result: measured before centroidal QP was aligned to the original
+> NLP's delta-coordinate Euler integration, previous-node warm start and absent
+> terminal joint bounds. Regenerate data to benchmark the current formulation.
+
 동일한 938변수 affine QP를 사용한다. OCP 경로는 상태와 입력을 모두 유지하며,
 full condensing 경로는 기존 stagewise SVD + 상태 재귀 대입으로 154변수로 줄인다.
 HPIPM robust 모드, 동일 허용오차, cold primal iterates, CPU 1코어 및 BLAS 1스레드.
