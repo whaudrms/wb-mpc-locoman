@@ -59,11 +59,12 @@ The optimization parameters fall into the following categories:
 
 ### Single convex QP: whole-body RNEA
 
-Select the following pair in `main.py`:
+Select the following configuration in `main.py`:
 
 ```python
 dynamics = "whole_body_rnea_qp"
-solver = "qp"
+solver = "OSQP"
+qp_condesed = False
 ```
 
 `OCPWholeBodyRNEAQP` builds **one affine horizon QP per MPC update** and
@@ -107,16 +108,71 @@ If ROS injects an incompatible Pinocchio through `PYTHONPATH`, run with
 
 ### Single convex QP: centroidal velocity
 
-The current `main.py` defaults select this pair:
+Select the solver and condensing independently in `main.py`:
 
 ```python
 dynamics = "centroidal_vel_qp"
-solver = "qp"
+solver = "qpOASE"     # "qpOASE" (or "qpOASES"), "OSQP", "HPIPM"
+qp_condesed = True    # Python True / False; parameter spelling is intentional
 ```
 
-This model shares the numeric QP backend in `optimization/affine_qp.py` with
-`whole_body_rnea_qp`. Each MPC update evaluates the model/Jacobian once and
-solves one horizon QP, without an SQP loop or line search.
+| Solver | `qp_condesed = False` | `qp_condesed = True` |
+|---|---|---|
+| `qpOASE` | Original QP, dense active-set solve | Condensed QP, dense active-set solve |
+| `OSQP` | Original sparse QP | Condensed QP |
+| `HPIPM` | Original OCP QP; states and inputs retained | Condensed dense QP |
+
+Every combination evaluates the model/Jacobian once and solves one horizon QP,
+without an SQP loop, line search, or automatic switch to another solver.
+The default 14-node trot case has 938 original variables and 154 condensed variables.
+The uncondensed qpOASES path can be very slow at this size; its dense active-set
+solve exceeded 130 seconds in a headless smoke check and was stopped. All six
+combinations were validated at four nodes, including a contact switch.
+The selected backend and condensing method appear in the solve log.
+`ocp.qp_backend` and `ocp.qp_condense_equalities` expose the selected settings.
+
+Solver options stay in `SOLVER_ARGS["qp"]` in `args.py`: `qpoases_opts` for
+qpOASES, `opts` for OSQP, and `hpipm_opts` / `hpipm_mode` for HPIPM.
+qpOASES uses `nWSR` for its iteration limit, OSQP uses `max_iter`, and HPIPM uses
+`iter_max`. The legacy `solver="qp"` still uses the model's default backend
+(qpOASES for centroidal, OSQP for RNEA); `qp_condesed` controls its reduction too.
+For nonlinear dynamics, keep `fatrop`, `ipopt`, or lowercase `osqp` (the SQP path).
+For the original RNEA QP configuration select `whole_body_rnea_qp`, `OSQP`, and
+`qp_condesed=False`.
+
+HPIPM is optional and is loaded only when selected. A project-local build is
+discovered automatically, so no HPIPM-specific PYTHONPATH/LD_LIBRARY_PATH is needed:
+
+```bash
+bash benchmarks/build_hpipm.sh .deps/hpipm
+env -u PYTHONPATH OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 python main.py
+```
+
+The current workspace already contains the tested native runtime in `.deps/hpipm`
+(ignored by Git). New checkouts need the build command above. The build targets
+AVX2/FMA by default; see `benchmarks/README.md` for other CPUs. To use a different
+build, set `HPIPM_ROOT` or `SOLVER_ARGS["qp"]["hpipm_root"]`. The build script sets
+shared-library SONAMEs needed by the loader; rebuild older benchmark-only builds
+with the updated script before selecting them as a runtime root.
+
+HPIPM with condensing disabled retains all states and inputs and converts each
+transition to `x_next = A*x + B*u + b`. It uses HPIPM's OCP solver. Local equality
+constraints are passed as identical lower/upper bounds. This path failed to
+converge at steps 94–96 in the saved benchmark; full condensing solved those QPs.
+Both paths reject failed solutions before updating the trajectory. Condensing
+can cost more than the solve time it saves; see the
+[HPIPM comparison](benchmarks/results/hpipm_condensing.md).
+
+The qpOASES adapter supplies a full symmetric dense Hessian and dense constraint
+matrix, reconstructing both triangles from the stored upper-triangular `P`.
+It reuses the CasADi solver function when dimensions match and recreates it when
+the condensed dimensions change. CasADi's qpOASES interface hot-starts repeated
+calls with updated Hessian/constraint matrices. Defaults use inactive initial
+bounds, full linear-independence tests, Cholesky refactorisation at each active-
+set iteration, and up to three iterative-refinement steps. The latter settings
+avoid the premature hot-start infeasibility seen with default factor updates.
+Failed, iteration-limited, or non-finite results are rejected before updating the prediction;
+there is no automatic retry with another solver.
 
 The physical state is **`[h/m, q]`**, where `h` contains CoM linear and angular
 momentum expressed in world axes. The optimization state is
@@ -147,19 +203,80 @@ use velocity finite differences, and base acceleration uses centroidal dynamics.
 The last input node uses the preceding joint-velocity interval because there is
 no terminal velocity input. They are output estimates, not optimization inputs.
 
-Before the solver call, centroidal QP eliminates affine equalities with a
-rank-revealing QR: the full trajectory correction is `offset + basis @ y`.
-It minimizes the same quadratic objective over `y` with the transformed
-inequalities. This is an algebraically equivalent QP, not another approximation
-or an additional optimization solve. It handles zero/redundant equality rows
-and rejects inconsistent ones. `last_qp` stores the original numeric problem;
-`last_solver_qp` stores the reduced problem. Residual acceptance is checked on
-the original full QP after reconstruction. This dense QR adds preparation cost
-but avoids the dual-convergence stalls observed on the full centroidal QP.
-RNEA QP continues to use its original uncondensed solve.
+With `qp_condesed=True`, centroidal QP uses **stagewise condensing** in
+`optimization/qp_condensing.py`. At each node a small SVD eliminates local
+momentum consistency, foot/arm velocity and fixed-force equalities. The
+manifold/momentum transition Jacobian then propagates the next state as an
+affine function of the remaining free inputs. This avoids factoring the entire
+horizon equality matrix. The full trajectory correction is `offset + basis @ y`;
+the quadratic objective and all inequalities are transformed into these free
+coordinates. Diagonal normalization of their cost curvature improves numerical
+conditioning without changing the objective or adding a penalty.
 
-Centroidal QP defaults to 50 OSQP equilibration passes (`scaling=50`) to improve
-conditioning between momentum and kinematic rows. Its OSQP workspace is rebuilt
+This is an algebraically equivalent version of the same linearized QP, not a
+single-rigid-body approximation: full kinematics, joint bounds and the existing
+torque estimates remain. The default 14-node trot case has 938 original variables
+and 154 free variables after condensation. Both `include_base` settings are
+supported. Transition rows are recorded during OCP construction so a vanishing
+Jacobian entry cannot change the detected dynamics structure.
+
+If a stage input block loses row rank, a transition is singular, or the stage
+structure is unsupported, the implementation falls back to the general
+rank-revealing QR reduction. It retains compatibility constraints and rejects
+inconsistent equalities; this fallback does not add an optimization solve.
+`qp_condensing_method` reports `none`, `stagewise`, or `global_qr`, and
+`qp_condensing_fallback_reason` records the reason when QR is needed.
+`last_qp` stores the original numeric problem; `last_solver_qp` stores the reduced
+problem. Residual acceptance is checked on the original QP after reconstruction.
+RNEA QP remains uncondensed when `qp_condesed=False`; explicit condensing uses the general QR reduction.
+
+For reproducible CPU timing, the headless validation used one BLAS/OpenMP
+thread. The same setting can be used when running the example:
+
+```bash
+env -u PYTHONPATH OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 python main.py
+```
+
+Timing attributes (seconds) separate `qp_condense_time`, `qp_setup_time`, and
+`qp_solver_time`. `qp_build_time` includes matrix assembly and condensation;
+`solve_time` includes assembly, condensation, backend setup/update and the solve,
+but excludes final residual evaluation and prediction reconstruction.
+
+The QP runtime now caches fixed CasADi variable/parameter expressions, sparse
+matrix layouts and state-integration functions. Stagewise condensing vectorizes
+constraint classification and avoids repeated sparse slicing. Equality checks,
+QR fallback and solver tolerances are retained.
+
+`main.py` also exposes:
+
+```python
+blas_threads = 1        # Set before importing NumPy/CasADi.
+qp_compile_data = True  # Native C evaluation for model/Jacobian and constraints.
+qp_profile = True       # Print assembly, condense, setup, solve and post times.
+```
+
+The first native build needs a C compiler (`cc`) and took about 4 min 37 s for
+this model. It is cached under `.deps/qp_codegen`; this workspace's 14-node model
+is already compiled. Subsequent initialization generates/hashes the code and
+loads the cached library (about 1.6 s in the check). Robot/horizon/graph changes
+may require a new build. Numerical state/target updates reuse the cache.
+`qp_compile_data=False` disables native compilation while keeping other runtime
+optimizations. This flag is separate from the legacy NLP `compile_solver` flag.
+
+The log retains the original solve time and additionally reports full MPC step
+time, including reference update and prediction reconstruction. Local results:
+initial QP processing about 20 ms, full step about 26 ms; across feasible steps
+0–96, averages were 27.2 ms and 33.7 ms. Late steps 90–96 still averaged 62 ms for
+the full step. These are observations, not an NLP comparison or deadline guarantee.
+See [measurement details](benchmarks/results/centroidal_runtime_optimized.md) and
+run `python benchmarks/profile_centroidal_runtime.py --verify` to reproduce.
+
+When explicitly selecting OSQP, centroidal QP defaults to 50 equilibration passes (`scaling=50`) to improve
+conditioning between momentum and kinematic rows. It updates the ADMM penalty
+every 25 iterations (`adaptive_rho_interval=25`) and uses `eps_prim_inf=1e-8`,
+`eps_dual_inf=1e-8` to avoid premature infeasibility certificates in condensed
+coordinates. Solution tolerances and original-QP residual acceptance remain
+unchanged. Its OSQP workspace is rebuilt
 for the current Jacobian each update: simply updating the first workspace can
 stall even when a fresh solve of the same QP converges. The shifted physical
 trajectory is still used as the linearization reference. This is matrix scaling
@@ -171,14 +288,19 @@ apply to this model.
 
 Validation: the regression suite covers both `include_base` settings,
 finite-difference Jacobian checks, QP convexity, equality-condensation
-exactness, momentum scaling, rotated-base arm targets, full-horizon output,
-contact switches, single solver calls, and the existing RNEA mode.
+exactness (including affine defects and rank-loss fallback), momentum scaling,
+rotated-base arm targets, full-horizon output,
+contact switches, single solver calls, qpOASES symmetric-Hessian conversion,
+solver failure handling, backend selection, and the existing RNEA mode.
 
 Known limitation of the current example: with 14 nodes, trot, base velocity
 `[0.1, 0, 0, 0, 0, 0]` and arm velocity `[0.1, 0, -0.2]`, the predicted-state
 rollout becomes affine-QP infeasible around `t = 1.455 s` (zero-based step 97).
-This was also confirmed on the original, uncondensed QP with an independent
-linear feasibility check. The solver stops without applying that failed
+The stagewise implementation completed steps 0 through 96 without QR fallback,
+then stopped at step 97, with both OSQP and qpOASES. Infeasibility was also
+confirmed on the original,
+uncondensed QP by HiGHS dual-simplex and interior-point feasibility checks
+with presolve disabled. The solver stops without applying that failed
 solution. The example is not a validated 200-step locomotion controller;
 longer operation may require task relaxation or a different reference/target
 policy, as well as validation against nonlinear contact dynamics.

@@ -1,3 +1,11 @@
+import os
+
+# Small QP blocks benefit from one BLAS thread; set before NumPy/CasADi imports.
+blas_threads = 1
+os.environ["OPENBLAS_NUM_THREADS"] = str(blas_threads)
+os.environ["OMP_NUM_THREADS"] = str(blas_threads)
+os.environ["MKL_NUM_THREADS"] = str(blas_threads)
+
 import time
 import numpy as np
 import pinocchio as pin
@@ -11,7 +19,7 @@ from optimization import make_ocp
 
 # Robot params
 robot = B2_Z1(reference_pose="standing_with_arm_up", arm_joints=4)
-dynamics = "centroidal_vel"  # see args.py for options
+dynamics = "centroidal_vel_qp"  # see args.py for options
 
 # Tracking targets
 base_vel_des = np.array([0.1, 0, 0, 0, 0, 0])  # linear + angular velocity
@@ -31,7 +39,10 @@ swing_height = 0.07             # meters
 swing_vel_limits = [0.1, -0.2]  # meters/second
 
 # Solver
-solver = "fatrop"  # see args.py for options
+solver = "HPIPM"  # "qpOASE" (qpOASES), "OSQP", "HPIPM"; legacy: "qp", "fatrop", "ipopt", "osqp"
+qp_condesed = True  # True: condensed QP; False: original QP (HPIPM uses OCP structure)
+qp_compile_data = True  # Compile model/Jacobian evaluation once and cache the shared library.
+qp_profile = True       # Print assembly/condensing/setup/solve/postprocessing times.
 warm_start = True
 compile_solver = False
 load_compiled_solver = None  # None or <filename> in "codegen/lib/"
@@ -43,8 +54,27 @@ mpc_loops = 200
 plot = False  # plot joint positions, velocities, torques
 
 
+def get_solver_configuration():
+    """Map main.py choices to the single-QP or legacy nonlinear solver API."""
+    if dynamics.endswith("_qp"):
+        backends = {"qpoase": "qpoases", "qpoases": "qpoases", "osqp": "osqp", "hpipm": "hpipm"}
+        settings = dict(SOLVER_ARGS["qp"], condensed=qp_condesed,
+                        compile_data=qp_compile_data, profile=qp_profile)
+        if solver != "qp":
+            try:
+                settings["backend"] = backends[solver.lower()]
+            except KeyError:
+                raise ValueError(f'{dynamics} requires solver="qpOASE", "OSQP", "HPIPM", or "qp"') from None
+        return "qp", settings
+    if solver not in ("fatrop", "ipopt", "osqp"):
+        raise ValueError('Nonlinear dynamics require solver="fatrop", "ipopt", or lowercase "osqp" (SQP)')
+    return solver, SOLVER_ARGS[solver]
+
+
 def mpc_loop(ocp):
     solve_times = []
+    control_step_times = []
+    integrate_state = ocp.dyn.state_integrate()
     constr_viol = []
 
     # Initialize params
@@ -53,11 +83,12 @@ def mpc_loop(ocp):
     ocp.update_params(x_init, t_current)
 
     # Initialize solver
-    ocp.init_solver(solver, SOLVER_ARGS[solver])
+    solver_kind, solver_settings = get_solver_configuration()
+    ocp.init_solver(solver_kind, solver_settings)
     if compile_solver:
         ocp.compile_solver()
 
-    if solver == "fatrop" or solver == "ipopt":
+    if solver_kind in ("fatrop", "ipopt"):
         # Get solver function
         if load_compiled_solver:
             solver_function = ca.external("solver_function", "codegen/lib/" + load_compiled_solver)
@@ -88,10 +119,11 @@ def mpc_loop(ocp):
             # Retract solution and update x_init
             ocp.retract_stacked_sol(sol_x, retract_all=False)
             dx_sol = ocp.DX_prev[1]
-            x_init = ocp.dyn.state_integrate()(x_init, dx_sol)
+            x_init = integrate_state(x_init, dx_sol)
 
     else:
         for k in range(mpc_loops):
+            step_start = time.perf_counter()
             # Update params
             t_current = k * dt_min
             ocp.update_params(x_init, t_current)
@@ -103,7 +135,8 @@ def mpc_loop(ocp):
 
             # Update x_init
             dx_sol = ocp.DX_prev[1]
-            x_init = ocp.dyn.state_integrate()(x_init, dx_sol)
+            x_init = integrate_state(x_init, dx_sol)
+            control_step_times.append(time.perf_counter() - step_start)
 
     # Compute total horizon time
     T = sum([ocp.opti.value(dt) for dt in ocp.dts])
@@ -111,6 +144,8 @@ def mpc_loop(ocp):
     print("************** STATS **************")
     print("Avg solve time (ms): ", np.average(solve_times) * 1000)
     print("Std solve time (ms): ", np.std(solve_times) * 1000)
+    if control_step_times:
+        print("Avg full MPC step (ms): ", np.average(control_step_times) * 1000)
     print("Avg CV (inf norm): ", np.average(constr_viol))
     print("Horizon length (s): ", T)
 
@@ -118,9 +153,7 @@ def mpc_loop(ocp):
 
 
 def main():
-    qp_dynamics = ("whole_body_rnea_qp", "centroidal_vel_qp")
-    if (dynamics in qp_dynamics) != (solver == "qp"):
-        raise ValueError(f'Use solver="qp" with one of {qp_dynamics}')
+    get_solver_configuration()  # Validate model/solver selection before building the OCP.
 
     # Initialize robot
     robot.set_gait_sequence(gait_type, gait_period)

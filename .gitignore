@@ -12,3 +12,6 @@ codegen/sqp
 __pycache__
 .vscode
 plots
+
+# Optional project-local native solver builds
+.deps/

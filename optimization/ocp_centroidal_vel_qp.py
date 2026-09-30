@@ -10,18 +10,29 @@ import pinocchio.casadi as cpin
 
 from .affine_qp import AffineQPMixin
 from .ocp_centroidal_vel import OCPCentroidalVel
+from .qp_condensing import condense_stagewise, StageCondensingError
 
 
 class OCPCentroidalVelQP(AffineQPMixin, OCPCentroidalVel):
     qp_model_name = "centroidal_vel_qp"
+    qp_default_backend = "qpoases"
+    # Options for the optional OSQP backend only.
     # Momentum consistency and kinematic rows have very different magnitudes.
     # More equilibration passes avoid stalled ADMM iterations at contact switches.
-    qp_default_options = {"scaling": 50}
+    qp_default_options = {
+        "scaling": 50,
+        "adaptive_rho_interval": 25,
+        # Default infeasibility tolerances can falsely reject feasible late
+        # horizon QPs in the condensed coordinates. Tighten certificates only;
+        # primal/dual solution tolerances and acceptance bounds are unchanged.
+        "eps_prim_inf": 1e-8,
+        "eps_dual_inf": 1e-8,
+    }
     # Re-equilibrate the current Jacobian and reset ADMM state each control step.
     # Reusing the first QP workspace can stall even when a fresh solve converges.
     qp_rebuild_solver = True
-    # Enforce equalities algebraically and optimize in their nullspace. This
-    # avoids stalled dual convergence of the much larger equality-constrained QP.
+    # Eliminate stage-local equalities, then propagate states through the horizon.
+    # A general QR is retained only for degenerate/unsupported stage structures.
     qp_condense_equalities = True
 
     def __init__(self, robot, nodes, tau_nodes, warm_start, include_base=True):
@@ -30,6 +41,7 @@ class OCPCentroidalVelQP(AffineQPMixin, OCPCentroidalVel):
         if not 0 <= tau_nodes <= nodes:
             raise ValueError("tau_nodes must be between zero and nodes")
         super().__init__(robot, nodes, tau_nodes, warm_start, include_base)
+        self._qp_dynamics_rows = []
         self._prediction = None
         self._time = 0.0
         q = ca.SX.sym("q", self.nq)
@@ -45,6 +57,19 @@ class OCPCentroidalVelQP(AffineQPMixin, OCPCentroidalVel):
         self._base_acceleration = self.dyn.base_acc_dynamics()
         self._torque_estimate = self.dyn.tau_estimate()
 
+    def condense_qp(self, qp):
+        self.qp_condensing_fallback_reason = None
+        try:
+            reduced = condense_stagewise(qp, self.ndx_opt, self.nu_opt[0],
+                                         self._qp_dynamics_rows)
+        except StageCondensingError as error:
+            # Preserve all compatibility equations at singular configurations.
+            # This is an algebraic fallback; the selected QP solver is still called only once.
+            self.qp_condensing_fallback_reason = str(error)
+            return super().condense_qp(qp)
+        self.qp_condensing_method = "stagewise"
+        return reduced
+
     def get_initial_q(self):
         # Unlike RNEA's [q, v], the physical state is [h/m, q].
         return self.x_init[6:]
@@ -53,9 +78,11 @@ class OCPCentroidalVelQP(AffineQPMixin, OCPCentroidalVel):
         h, q = self.get_h(i), self.get_q(i)
         v, f = self.get_v(i), self.get_forces(i)
         dt = self.dts[i]
+        row_start = self.opti.ng
         self.opti.subject_to(self.get_h(i + 1) == h + dt * self._com_dynamics(q, f))
         q_next = self._integrate_q(q, dt * v)
         self.opti.subject_to(self._difference_q(q_next, self.get_q(i + 1)) == 0)
+        self._qp_dynamics_rows.append(np.arange(row_start, self.opti.ng))
         if self.include_base:
             self.opti.subject_to(self._momentum_gap(h, q, v) == 0)
         if i < self.tau_nodes:
@@ -125,7 +152,7 @@ class OCPCentroidalVelQP(AffineQPMixin, OCPCentroidalVel):
         self.DX_prev.append(sol_x[self.nodes * stride:].copy())
         self.U_prev = [sol_x[i * stride + self.ndx_opt:(i + 1) * stride].copy()
                        for i in range(self.nodes)]
-        states = [np.asarray(self.dyn.state_integrate()(x_init, dx)).ravel() for dx in self.DX_prev]
+        states = [np.asarray(self._qp_integrate(x_init, dx)).ravel() for dx in self.DX_prev]
         velocities = []
         for x, u in zip(states, self.U_prev):
             if self.include_base:

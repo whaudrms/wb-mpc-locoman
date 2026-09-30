@@ -24,9 +24,32 @@ DYN_ARGS = {
 # Arguments for each solver
 SOLVER_ARGS = {
     "qp": {
+        # Default backend: centroidal_vel_qp -> qpoases; whole_body_rnea_qp -> osqp.
+        # main.py selects the backend and condensing; "qp" retains model defaults.
+        "qpoases_opts": {
+            "printLevel": "none",
+            "nWSR": 10000,  # Active-set recalculations within ONE QP solve.
+            "terminationTolerance": 1e-8,
+            "initialStatusBounds": "inactive",
+            "enableFullLITests": True,  # Robust handling of dependent constraints.
+            "enableCholeskyRefactorisation": 1,  # Re-factor as the active set changes.
+            "numRefinementSteps": 3,  # Reduce hot-start roundoff in late horizon QPs.
+
+        },
+        "hpipm_mode": "robust",
+        "hpipm_root": None,  # HPIPM_ROOT env, project .deps/hpipm, or system installation.
+        "hpipm_opts": {
+            "iter_max": 100,
+            "tol_stat": 1e-7,
+            "tol_eq": 1e-8,
+            "tol_ineq": 1e-8,
+            "tol_comp": 1e-8,
+            "reg_prim": 1e-12,
+            "warm_start": 0,  # MPC reference is shifted; QP coordinates can change.
+        },
         "regularization": 1e-8,
         "max_qp_violation": 1e-3,
-        "opts": {
+        "opts": {  # OSQP options only.
             "verbose": False,
             "max_iter": 100000,  # OSQP iterations within ONE QP solve
             "eps_abs": 1e-6,

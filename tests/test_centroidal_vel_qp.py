@@ -4,7 +4,6 @@ from unittest.mock import patch
 
 import casadi as ca
 import numpy as np
-import osqp
 import pinocchio as pin
 from scipy import sparse
 
@@ -44,6 +43,16 @@ class CentroidalVelocityQPTests(unittest.TestCase):
                 gm = np.asarray(o.g_data(o.qp_reference - eps * direction, o.qp_params)[0]).ravel()
                 np.testing.assert_allclose((gp - gm) / (2 * eps), qp["A"] @ direction,
                                            atol=2e-6, rtol=2e-5)
+
+    def test_cached_sparse_layout_is_not_mutated_by_numeric_cleanup(self):
+        o = self.make_problem()
+        before = o.build_qp()
+        pattern = o._pattern(before['A'])
+        expected = before['A'].toarray()
+        before['A'].eliminate_zeros()
+        after = o.build_qp()
+        self.assertEqual(o._pattern(after['A']), pattern)
+        np.testing.assert_array_equal(after['A'].toarray(), expected)
 
     def test_full_retraction_and_mass_normalized_momentum(self):
         for include_base in (True, False):
@@ -98,10 +107,11 @@ class CentroidalVelocityQPTests(unittest.TestCase):
         np.testing.assert_allclose(actual[:6], (1 - alpha) * xa[:6] + alpha * xb[:6])
         expected_q = pin.integrate(o.model, xa[6:], alpha * pin.difference(o.model, xa[6:], xb[6:]))
         np.testing.assert_allclose(actual[6:], expected_q, atol=1e-10)
-        with patch("optimization.affine_qp.osqp.OSQP.solve", autospec=True, side_effect=osqp.OSQP.solve) as solve:
+        with patch.object(o, "_solve_qpoases", wraps=o._solve_qpoases) as solve:
             with patch.object(o, "_armijo_line_search", side_effect=AssertionError("unexpected line search")):
                 o.solve(retract_all=False)
             self.assertEqual(solve.call_count, 1)
+        self.assertEqual(o.qp_backend, "qpoases")
         self.assertEqual(o.qp_solve_count, 2)
         self.assertLess(o.qp_constr_viol, SOLVER_ARGS["qp"]["max_qp_violation"])
 
@@ -120,6 +130,69 @@ class CentroidalVelocityQPTests(unittest.TestCase):
             forces = u[o.f_idx:o.f_idx + 12].reshape(4, 3)
             np.testing.assert_allclose(forces[schedule[:, k] == 0], 0., atol=1e-5)
             self.assertTrue(np.all(np.abs(forces[:, 0]) + np.abs(forces[:, 1]) <= .9 * forces[:, 2] + 1e-5))
+
+    def test_stagewise_reconstruction_for_both_input_modes_and_gaits(self):
+        rng = np.random.default_rng(31)
+        for include_base in (True, False):
+            for gait, free_per_stage in (("stand", 13), ("trot", 11)):
+                with self.subTest(include_base=include_base, gait=gait):
+                    o = self.make_problem(include_base, gait)
+                    # Nonzero reference coordinates exercise manifold transition blocks.
+                    for k in range(1, o.nodes + 1):
+                        o.opti.set_initial(o.DX_opt[k], rng.normal(size=o.ndx_opt) * .003)
+                    qp = o.build_qp()
+                    reduced, basis, offset = o.condense_qp(qp)
+                    self.assertEqual(o.qp_condensing_method, "stagewise")
+                    self.assertEqual(reduced["q"].size, free_per_stage * o.nodes)
+                    self.assertIsNone(o.qp_condensing_fallback_reason)
+                    eq = np.isfinite(qp["l"]) & (qp["l"] == qp["u"])
+                    for y in (np.zeros(basis.shape[1]), rng.normal(size=basis.shape[1])):
+                        np.testing.assert_allclose(qp["A"][eq] @ (offset + basis @ y),
+                                                   qp["l"][eq], atol=1e-8)
+
+    def test_rank_loss_falls_back_without_dropping_compatibility_equations(self):
+        o = self.make_problem()
+        qp = o.build_qp()
+        row = o._qp_dynamics_rows[0][-1] + 1  # First momentum consistency row.
+        qp["A"] = sparse.vstack((qp["A"], qp["A"][row]), format="csc")
+        qp["l"] = np.r_[qp["l"], qp["l"][row]]
+        qp["u"] = np.r_[qp["u"], qp["u"][row]]
+        with patch.object(o, "build_qp", return_value=qp):
+            o.solve(retract_all=False)
+        self.assertEqual(o.qp_condensing_method, "global_qr")
+        self.assertIn("row rank", o.qp_condensing_fallback_reason)
+        self.assertEqual(o.qp_solve_count, 1)
+        self.assertLess(o.qp_constr_viol, 1e-6)
+        prediction = o._prediction
+        qp["l"][-1] += 1.
+        qp["u"][-1] += 1.
+        with patch.object(o, "build_qp", return_value=qp):
+            with self.assertRaisesRegex(ValueError, "Inconsistent affine equality"):
+                o.solve(retract_all=False)
+        self.assertIs(o._prediction, prediction)
+        self.assertEqual(o.qp_solve_count, 1)
+
+    def test_qpoases_iteration_failure_does_not_apply_prediction(self):
+        o = self.make_problem()
+        settings = dict(SOLVER_ARGS["qp"])
+        settings["qpoases_opts"] = dict(settings["qpoases_opts"], nWSR=0)
+        o.init_solver("qp", settings)
+        with self.assertRaisesRegex(RuntimeError, "no solution applied"):
+            o.solve(retract_all=False)
+        self.assertIsNone(o._prediction)
+        self.assertEqual(o.qp_solve_count, 1)
+        self.assertEqual(len(o.q_sol), 0)
+
+    def test_explicit_osqp_backend_and_invalid_backend(self):
+        o = self.make_problem()
+        settings = dict(SOLVER_ARGS["qp"], backend="osqp")
+        o.init_solver("qp", settings)
+        o.solve(retract_all=False)
+        self.assertEqual(o.qp_backend, "osqp")
+        self.assertEqual(o.qp_solve_count, 1)
+        self.assertLess(o.qp_constr_viol, 1e-6)
+        with self.assertRaisesRegex(ValueError, "Unknown QP backend"):
+            o.init_solver("qp", dict(settings, backend="invalid"))
 
     def test_existing_centroidal_factory_and_solver_guard(self):
         o = self.make_problem()
